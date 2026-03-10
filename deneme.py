@@ -12,7 +12,7 @@ if not cap.isOpened():
     exit()
 
 # Seri haberleşme
-uart_serial = serial.Serial("COM10", baudrate=9600, timeout=2)
+uart_serial = serial.Serial("/dev/ttyUSB0", baudrate=9600, timeout=2)
 START_BYTES = bytes([170, 85])
 END_BYTE = bytes([13])
 
