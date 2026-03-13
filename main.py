@@ -14,7 +14,7 @@ siniflar = ['crosswalk', 'railroad', 'park', 'other']
 MIN_ALAN = 200
 MAX_ASPECT = 1.8
 MIN_ASPECT = 0.6
-TABELA_SINIFLARI = [2, 3, 4, 5, 6, 7, 8, 9, 11, 12]
+TABELA_SINIFLARI = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12]
 
 # Durum değişkenleri
 stop_crosswalk = False
@@ -394,3 +394,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
