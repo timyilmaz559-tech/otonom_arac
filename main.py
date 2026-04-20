@@ -4,9 +4,9 @@ import time
 import serial
 import struct
 from ultralytics import YOLO
+from picamera2 import Picamera2
 
 # Tek model - hem tespit hem sınıflandırma
-# Sınıflar: 0=crosswalk, 1=railroad, 2=park, 3=other
 detector = YOLO('last.pt')
 siniflar = {0: 'park', 1: 'railroad', 2: 'walkside', 3: 'objects'}
 
@@ -22,13 +22,14 @@ ignore_red_triangle = False
 detected_green_traffic_light = False
 
 # Seri port
+uart_serial = None
 for port in ["/dev/ttyUSB0", "/dev/ttyAMA0", "/dev/ttyACM0"]:
     try:
         uart_serial = serial.Serial(port, baudrate=9600, timeout=2)
         print(f"Seri port açıldı: {port}")
         break
     except serial.SerialException:
-        uart_serial = None
+        continue
 
 START_BYTES = bytes([170, 85])
 END_BYTE = bytes([13])
@@ -44,6 +45,27 @@ def motor_control(speed=0, steering=0):
     uart_serial.write(START_BYTES + payload + END_BYTE)
     uart_serial.flush()
     print("Sent:", speed, steering)
+
+
+# ------------------ Kamera Başlatma ------------------
+def init_cameras():
+    # Çizgi kamerası (index 0)
+    cam_lane = Picamera2(0)
+    cam_lane.configure(cam_lane.create_preview_configuration(
+        main={"format": "BGR888", "size": (640, 480)}
+    ))
+    cam_lane.start()
+
+    # Tespit kamerası (index 1)
+    cam_detect = Picamera2(1)
+    cam_detect.configure(cam_detect.create_preview_configuration(
+        main={"format": "BGR888", "size": (640, 480)}
+    ))
+    cam_detect.start()
+
+    time.sleep(0.5)  # Kameraların stabil olması için bekle
+    print("Kameralar başlatıldı.")
+    return cam_lane, cam_detect
 
 
 # ------------------ Şerit Takibi ------------------
@@ -98,9 +120,7 @@ def detect_sign(frame):
         sinif_id = int(box.cls[0])
         guven = float(box.conf[0])
 
-        if sinif_id not in siniflar:
-            continue
-        if guven < MIN_GUVEN:
+        if sinif_id not in siniflar or guven < MIN_GUVEN:
             continue
 
         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -123,7 +143,6 @@ def detect_sign(frame):
 # ------------------ Araç Model Tespiti ------------------
 def detect_obj(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
     mask_yellow = cv2.inRange(hsv, np.array([20, 100, 100]), np.array([35, 255, 255]))
     mask_orange = cv2.inRange(hsv, np.array([5, 100, 100]), np.array([15, 255, 255]))
 
@@ -167,84 +186,76 @@ def main():
     last_detection_time = 0
     cooldown = 10
 
-    cap_lane = cv2.VideoCapture(0)
-    cap_detect = cap_lane
-
-    if not cap_lane.isOpened():
-        print("Çizgi camera açılamadı!")
-        return
-    if not cap_detect.isOpened():
-        print("Misc. camera açılamadı!")
-        return
+    cam_lane, cam_detect = init_cameras()
 
     KP = 0.4
     speed = 100
 
-    while True:
-        ret_lane, frame_lane = cap_lane.read()
-        ret_detect, frame_detect = cap_detect.read()
+    try:
+        while True:
+            # Picamera2'den frame al (numpy array, BGR)
+            frame_lane = cam_lane.capture_array()
+            frame_detect = cam_detect.capture_array()
 
-        if not ret_lane or not ret_detect:
-            print("Kameradan görüntü alınamadı!")
-            break
+            green_light = detect_traffic_light(frame_detect)
+            if green_light and not detected_green_traffic_light:
+                print("Yeşil ışık yandı")
+                detected_green_traffic_light = True
 
-        green_light = detect_traffic_light(frame_detect)
-        if green_light and not detected_green_traffic_light:
-            print("Yeşil ışık yandı")
-            detected_green_traffic_light = True
+            sign = detect_sign(frame_detect)
+            obj, obj_height = detect_obj(frame_detect)
 
-        sign = detect_sign(frame_detect)
-        obj, obj_height = detect_obj(frame_detect)
-
-        offset = detect_lane(frame_lane, lane_type='both')
-        steering = max(-100, min(100, offset * KP))
-
-        if sign == "park":
-            print("PARK ALANI - Sağa yanaş ve dur")
-            offset = detect_lane(frame_lane, lane_type='park')
+            offset = detect_lane(frame_lane, lane_type='both')
             steering = max(-100, min(100, offset * KP))
-            motor_control(0, steering)
-            time.sleep(2)
-            motor_control(0, 0)
 
-        elif (sign == "crosswalk" or sign == "railroad") and not stop_red_triangle:
-            red_triangle_count += 1
-            if red_triangle_count == 1:
+            if sign == "park":
+                print("PARK ALANI - Sağa yanaş ve dur")
+                offset = detect_lane(frame_lane, lane_type='park')
+                steering = max(-100, min(100, offset * KP))
+                motor_control(0, steering)
+                time.sleep(2)
                 motor_control(0, 0)
-                time.sleep(5)
-                ignore_red_triangle = True
-                print("First stop at red triangle")
-            elif red_triangle_count == 2 and not ignore_red_triangle:
-                motor_control(0, 0)
-                time.sleep(5)
-                print("Second and last time at stop red triangle")
-                stop_red_triangle = True
+                break
 
-        else:
-            if detected_green_traffic_light:
-                motor_control(speed, steering)
+            if (sign == "walkside" or sign == "railroad") and not stop_red_triangle:
+                red_triangle_count += 1
+                if red_triangle_count == 1:
+                    motor_control(0, 0)
+                    time.sleep(5)
+                    ignore_red_triangle = True
+                    print("First stop at red triangle")
+                elif red_triangle_count == 2 and not ignore_red_triangle:
+                    motor_control(0, 0)
+                    time.sleep(5)
+                    print("Second and last time at stop red triangle")
+                    stop_red_triangle = True
 
-        if obj == "SOLLAMA YASAK":
-            motor_control(0, 45)
-            break
-        elif obj == "SOLLAMA SERBEST":
-            motor_control(50, 45)
-            continue
+            else:
+                if detected_green_traffic_light:
+                    motor_control(speed, steering)
 
-        current_time = time.time()
-        if ignore_red_triangle and (current_time - last_detection_time > cooldown):
-            last_detection_time = current_time
-            ignore_red_triangle = False
+            if obj == "SOLLAMA YASAK":
+                motor_control(0, 45)
+                break
+            elif obj == "SOLLAMA SERBEST":
+                motor_control(50, 45)
+                continue
 
-        cv2.imshow("Lane Camera", frame_lane)
-        cv2.imshow("Detection Camera", frame_detect)
+            current_time = time.time()
+            if ignore_red_triangle and (current_time - last_detection_time > cooldown):
+                last_detection_time = current_time
+                ignore_red_triangle = False
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            cv2.imshow("Lane Camera", frame_lane)
+            cv2.imshow("Detection Camera", frame_detect)
 
-    cap_lane.release()
-    cap_detect.release()
-    cv2.destroyAllWindows()
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    finally:
+        cam_lane.stop()
+        cam_detect.stop()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
